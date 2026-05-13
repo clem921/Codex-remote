@@ -35,15 +35,16 @@ wss.on("connection", (mobile, req) => {
   console.log("Android client connected");
 
   let nextId = 1;
-  let threadId = null;
+  let activeThreadId = null;
   const pendingById = new Map();
   const queuedPrompts = [];
   const codex = new WebSocket(codexUrl);
 
-  function request(method, params = {}) {
+  function request(method, params = {}, meta = {}) {
     const id = nextId++;
-    pendingById.set(id, method);
+    pendingById.set(id, { method, meta });
     codex.send(JSON.stringify({ jsonrpc: "2.0", id, method, params }));
+    return id;
   }
 
   function notify(method, params = {}) {
@@ -51,25 +52,26 @@ wss.on("connection", (mobile, req) => {
   }
 
   function startThread() {
-    request("thread/start", codexCwd ? { cwd: codexCwd } : {});
+    request("thread/start", codexCwd ? { cwd: codexCwd } : {}, { reason: "new_thread" });
   }
 
-  function startTurn(text) {
-    if (!threadId) {
+  function startTurn(text, requestedThreadId = null) {
+    const targetThreadId = requestedThreadId || activeThreadId;
+    if (!targetThreadId) {
       queuedPrompts.push(text);
       sendJson(mobile, { type: "bridge_status", status: "prompt_queued" });
       return;
     }
 
     request("turn/start", {
-      threadId,
+      threadId: targetThreadId,
       input: [{ type: "text", text }]
-    });
+    }, { threadId: targetThreadId });
   }
 
   function flushQueue() {
-    while (threadId && queuedPrompts.length > 0) {
-      startTurn(queuedPrompts.shift());
+    while (activeThreadId && queuedPrompts.length > 0) {
+      startTurn(queuedPrompts.shift(), activeThreadId);
     }
   }
 
@@ -78,7 +80,7 @@ wss.on("connection", (mobile, req) => {
     request("initialize", {
       clientInfo: {
         name: "codex_remote_android",
-        version: "0.1.0"
+        version: "0.2.0"
       }
     });
   });
@@ -95,25 +97,30 @@ wss.on("connection", (mobile, req) => {
     }
 
     if (msg.id !== undefined && pendingById.has(msg.id)) {
-      const method = pendingById.get(msg.id);
+      const pending = pendingById.get(msg.id);
       pendingById.delete(msg.id);
 
       if (msg.error) {
-        sendJson(mobile, { type: "bridge_error", message: `${method}: ${msg.error.message || JSON.stringify(msg.error)}` });
+        sendJson(mobile, { type: "bridge_error", message: `${pending.method}: ${msg.error.message || JSON.stringify(msg.error)}` });
         return;
       }
 
-      if (method === "initialize") {
+      if (pending.method === "initialize") {
         notify("initialized");
         sendJson(mobile, { type: "bridge_status", status: "codex_initialized" });
         startThread();
         return;
       }
 
-      if (method === "thread/start") {
-        threadId = msg.result?.thread?.id || msg.result?.id || msg.result?.threadId || null;
-        sendJson(mobile, { type: "bridge_status", status: "thread_started", threadId });
+      if (pending.method === "thread/start") {
+        activeThreadId = msg.result?.thread?.id || msg.result?.id || msg.result?.threadId || activeThreadId;
+        sendJson(mobile, { type: "bridge_status", status: "thread_started", threadId: activeThreadId });
         flushQueue();
+        return;
+      }
+
+      if (pending.method === "turn/start") {
+        sendJson(mobile, { type: "bridge_status", status: "turn_started", threadId: pending.meta.threadId || activeThreadId });
       }
     }
   });
@@ -136,12 +143,24 @@ wss.on("connection", (mobile, req) => {
     }
 
     if (msg.type === "hello") {
-      sendJson(mobile, { type: "bridge_status", status: threadId ? "ready" : "connecting" });
+      sendJson(mobile, { type: "bridge_status", status: activeThreadId ? "ready" : "connecting" });
+      return;
+    }
+
+    if (msg.type === "new_thread") {
+      startThread();
+      return;
+    }
+
+    if (msg.type === "select_thread" && typeof msg.threadId === "string") {
+      activeThreadId = msg.threadId;
+      sendJson(mobile, { type: "bridge_status", status: "thread_selected", threadId: activeThreadId });
       return;
     }
 
     if (msg.type === "user_prompt" && typeof msg.text === "string") {
-      startTurn(msg.text);
+      const targetThreadId = typeof msg.threadId === "string" ? msg.threadId : activeThreadId;
+      startTurn(msg.text, targetThreadId);
       return;
     }
 
